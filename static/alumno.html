@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Votación en vivo · Alumno</title>
+  <link rel="stylesheet" href="/static/estilo.css">
+</head>
+<body>
+
+<section id="pantalla-nombre" class="centro">
+  <h1>Votación en vivo</h1>
+  <p>Escribe tu nombre para entrar. Cada pregunta dura 30 segundos y solo puedes votar una vez.</p>
+  <form id="form-nombre" class="fila-controles">
+    <input id="inp-nombre" type="text" maxlength="30" placeholder="Tu nombre" autocomplete="off" required style="flex:1">
+    <button class="btn btn-primario">Entrar</button>
+  </form>
+</section>
+
+<div id="tablero-envoltorio" hidden>
+  <header class="cabecera">
+    <div><strong>Votación en vivo</strong><small>Alumno</small></div>
+    <div class="chips">
+      <span id="chip-nombre" class="chip"></span>
+      <span id="chip-conexion" class="chip">● sin conexión</span>
+    </div>
+  </header>
+
+  <main class="tablero">
+    <article class="widget">
+      <header class="widget-cab">
+        <h2>Pregunta actual</h2>
+        <p>Recibida por SSE · tiempo restante con <code>TTL pregunta:N:abierta</code></p>
+      </header>
+      <div class="widget-cuerpo">
+        <div class="reloj"><b id="reloj">--</b><div class="reloj-pista"><i id="barra"></i></div></div>
+        <p id="enunciado" class="enunciado">Esperando la próxima pregunta del docente…</p>
+        <div id="opciones" class="opciones"></div>
+        <p id="msg" class="msg"></p>
+      </div>
+      <pre id="term-pregunta" class="terminal"></pre>
+    </article>
+
+    <article class="widget" id="resultados" hidden>
+      <header class="widget-cab">
+        <h2>Resultados</h2>
+        <p>Un único mensaje de cierre con la correcta, los votos y el top 5</p>
+      </header>
+      <div class="widget-cuerpo">
+        <p id="veredicto" class="veredicto"></p>
+        <div id="grafico"></div>
+        <h3>Top 5</h3>
+        <ol id="ranking" class="ranking"></ol>
+      </div>
+      <pre id="term-resultados" class="terminal"></pre>
+    </article>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+const nombre = () => sessionStorage.nombre;
+let actual = null, cerradoId = null, bloqueado = false, sondeo = null;
+
+const reloj = temporizador($("#reloj"), $("#barra"), {
+  onFin() {
+    document.querySelectorAll(".opcion").forEach((b) => { b.disabled = true; });
+    if (cerradoId === null) {
+      $("#msg").textContent = "Tiempo agotado. Calculando resultados…";
+      setTimeout(cargarEstado, 2500);
+    }
+  },
+});
+
+$("#form-nombre").onsubmit = (e) => {
+  e.preventDefault();
+  const n = $("#inp-nombre").value.trim();
+  if (!n) return;
+  sessionStorage.nombre = n;
+  entrar();
+};
+if (sessionStorage.nombre) entrar();
+
+function entrar() {
+  $("#pantalla-nombre").hidden = true;
+  $("#tablero-envoltorio").hidden = false;
+  $("#chip-nombre").textContent = nombre();
+  conectar("#term-pregunta", "#chip-conexion", { onPregunta, onCierre, onAbrir: cargarEstado });
+}
+
+function onPregunta(m) {
+  mostrar(m, false);
+  cargarEstado();
+}
+
+function mostrar(p, yaVoto) {
+  actual = p;
+  cerradoId = null;
+  bloqueado = yaVoto;
+  $("#resultados").hidden = true;
+  $("#enunciado").textContent = p.texto;
+  $("#opciones").innerHTML = p.opciones
+    .map((o, i) => `<button class="opcion" data-i="${i}"><span>${letra(i)}</span>${esc(o)}</button>`).join("");
+  const previo = sessionStorage["voto" + p.id];
+  document.querySelectorAll(".opcion").forEach((b) => {
+    b.onclick = () => votar(+b.dataset.i, b);
+    if (yaVoto) {
+      b.disabled = true;
+      if (previo !== undefined && +previo === +b.dataset.i) b.classList.add("elegida");
+    }
+  });
+  $("#msg").textContent = yaVoto ? "Ya votaste en esta pregunta." : "Elige una opción.";
+  clearInterval(sondeo);
+  sondeo = setInterval(cargarEstado, 5000);
+}
+
+async function cargarEstado() {
+  const d = await api(`/api/estado?nombre=${encodeURIComponent(nombre())}`);
+  volcar("#term-pregunta", d.comandos);
+  if (d.estado === "abierta") {
+    if (!actual || actual.id !== d.id || cerradoId !== null) mostrar(d, d.yaVoto);
+    else if (d.yaVoto && !bloqueado) { bloqueado = true; document.querySelectorAll(".opcion").forEach((b) => { b.disabled = true; }); }
+    reloj.sincronizar(d.restante);
+  } else if (d.estado === "cerrada") {
+    if (cerradoId !== d.cierre.id) onCierre(d.cierre);
+  } else if (d.estado === "cerrando") {
+    reloj.detener();
+    $("#msg").textContent = "Calculando resultados…";
+    setTimeout(cargarEstado, 1000);
+  }
+}
+
+async function votar(i, boton) {
+  if (bloqueado) return;
+  bloqueado = true;
+  document.querySelectorAll(".opcion").forEach((b) => { b.disabled = true; });
+  try {
+    const r = await api("/api/votar", { method: "POST", body: { nombre: nombre(), id: actual.id, opcion: i } });
+    volcar("#term-pregunta", r.comandos);
+    if (r.ok) {
+      boton.classList.add("elegida");
+      sessionStorage["voto" + actual.id] = i;
+      $("#msg").textContent = "Voto registrado. Espera el cierre.";
+    } else {
+      $("#msg").textContent = r.error;
+    }
+  } catch (e) {
+    bloqueado = false;
+    document.querySelectorAll(".opcion").forEach((b) => { b.disabled = false; });
+    $("#msg").textContent = "No se pudo enviar el voto. Intenta de nuevo.";
+  }
+}
+
+function onCierre(m) {
+  cerradoId = m.id;
+  clearInterval(sondeo);
+  reloj.detener();
+  if (!actual || actual.id !== m.id) {
+    $("#enunciado").textContent = m.texto;
+    $("#opciones").innerHTML = "";
+  }
+  document.querySelectorAll(".opcion").forEach((b) => {
+    b.disabled = true;
+    if (+b.dataset.i === m.correcta) b.classList.add("correcta");
+  });
+  $("#msg").textContent = `Respuesta correcta: ${letra(m.correcta)} · ${m.opciones[m.correcta]}`;
+
+  const mio = sessionStorage["voto" + m.id];
+  const v = $("#veredicto");
+  v.textContent = mio === undefined ? "" : (+mio === m.correcta ? "Acertaste." : "Fallaste.");
+  v.style.color = mio !== undefined && +mio === m.correcta ? "var(--ok)" : "var(--error)";
+
+  grafico($("#grafico"), m.opciones, m.votos, m.correcta);
+  listaRanking($("#ranking"), m.ranking);
+  volcar("#term-resultados", m.comandos);
+  $("#resultados").hidden = false;
+}
+</script>
+</body>
+</html>

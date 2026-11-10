@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Votación en vivo · Docente</title>
+  <link rel="stylesheet" href="/static/estilo.css">
+</head>
+<body>
+
+<section id="pantalla-rol" class="centro">
+  <h1>Panel del docente</h1>
+  <p>Solo puede haber un docente a la vez: <code>SET lock:docente token NX EX 30</code>.</p>
+  <p id="estado-lock">consultando…</p>
+  <button id="btn-tomar" class="btn btn-primario">Tomar rol de docente</button>
+</section>
+
+<div id="tablero-envoltorio" hidden>
+  <header class="cabecera">
+    <div><strong>Votación en vivo</strong><small>Docente</small></div>
+    <div class="chips">
+      <span class="chip">lock:docente · <b id="lock-ttl">30</b> s</span>
+      <span id="chip-conexion" class="chip">● sin conexión</span>
+    </div>
+  </header>
+
+  <main class="tablero">
+    <article class="widget">
+      <header class="widget-cab">
+        <h2>Crear y lanzar pregunta</h2>
+        <p>De 3 a 5 opciones · marca la correcta</p>
+      </header>
+      <div class="widget-cuerpo">
+        <textarea id="inp-texto" maxlength="200" placeholder="Texto de la pregunta"></textarea>
+        <div id="filas-op"></div>
+        <div class="fila-controles">
+          <button id="btn-mas" class="btn" type="button">Agregar opción</button>
+          <button id="btn-lanzar" class="btn btn-primario" type="button">Lanzar (30 s)</button>
+        </div>
+        <div class="reloj"><b id="reloj">--</b><div class="reloj-pista"><i id="barra"></i></div></div>
+        <p id="msg" class="msg"></p>
+      </div>
+      <pre id="term-lanzar" class="terminal"></pre>
+    </article>
+
+    <article class="widget">
+      <header class="widget-cab">
+        <h2>Cierre</h2>
+        <p>Gráfico de votos y top 5 al terminar el tiempo</p>
+      </header>
+      <div class="widget-cuerpo">
+        <p id="enunciado" class="enunciado"></p>
+        <div id="grafico"><p class="msg">Los conteos aparecen solo al cierre.</p></div>
+        <h3>Top 5</h3>
+        <ol id="ranking" class="ranking"></ol>
+      </div>
+      <pre id="term-stream" class="terminal"></pre>
+    </article>
+
+    <article class="widget">
+      <header class="widget-cab">
+        <h2>Estadísticas</h2>
+        <p>Agregaciones sobre la colección <code>preguntas</code> de MongoDB</p>
+      </header>
+      <div class="widget-cuerpo">
+        <div><button id="btn-stats" class="btn">Calcular estadísticas</button></div>
+        <div id="stats"></div>
+      </div>
+      <pre id="term-stats" class="terminal"></pre>
+    </article>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+let ops = ["", "", ""], correcta = 0, sondeo = null;
+
+const reloj = temporizador($("#reloj"), $("#barra"), {
+  onFin() { $("#msg").textContent = "Tiempo agotado. Calculando resultados…"; setTimeout(cargarEstado, 2500); },
+});
+
+async function estadoLock() {
+  const { ocupado, ttl } = await api("/api/docente");
+  $("#estado-lock").textContent = ocupado ? `Ocupado · el lock expira en ${ttl} s` : "Disponible";
+}
+estadoLock();
+const sondeoLock = setInterval(estadoLock, 5000);
+
+$("#btn-tomar").onclick = async () => {
+  const r = await api("/api/docente/tomar", { method: "POST", body: { token } });
+  if (!r._ok) { $("#estado-lock").textContent = r.error; return; }
+  clearInterval(sondeoLock);
+  $("#pantalla-rol").hidden = true;
+  $("#tablero-envoltorio").hidden = false;
+  terminal("#term-lanzar", `SET lock:docente "${token.slice(0, 8)}…" NX EX 30`, "OK");
+  iniciarDocente();
+};
+
+function iniciarDocente() {
+  let ttl = 30;
+  setInterval(() => { $("#lock-ttl").textContent = Math.max(--ttl, 0); }, 1000);
+  setInterval(async () => {
+    ({ ttl } = await api("/api/docente/heartbeat", { method: "POST", body: { token } }));
+    if (ttl < 0) { alert("Se perdió el lock de docente."); location.reload(); }
+  }, 10000);
+  window.addEventListener("pagehide", () =>
+    navigator.sendBeacon("/api/docente/soltar", new Blob([JSON.stringify({ token })], { type: "application/json" })));
+
+  pintarFilas();
+  conectar("#term-stream", "#chip-conexion", { onPregunta, onCierre, onAbrir: cargarEstado });
+}
+
+function pintarFilas() {
+  $("#filas-op").innerHTML = ops.map((o, i) => `
+    <div class="fila-op" style="margin-bottom:8px">
+      <input type="radio" name="correcta" ${i === correcta ? "checked" : ""} data-r="${i}" title="Opción correcta">
+      <input type="text" maxlength="80" value="${esc(o)}" data-t="${i}" placeholder="Opción ${letra(i)}">
+      <button class="btn" type="button" data-x="${i}" ${ops.length <= 3 ? "disabled" : ""}>Quitar</button>
+    </div>`).join("");
+  document.querySelectorAll("[data-r]").forEach((r) => { r.onchange = () => { correcta = +r.dataset.r; }; });
+  document.querySelectorAll("[data-t]").forEach((t) => { t.oninput = () => { ops[+t.dataset.t] = t.value; }; });
+  document.querySelectorAll("[data-x]").forEach((x) => {
+    x.onclick = () => {
+      const i = +x.dataset.x;
+      ops.splice(i, 1);
+      if (correcta === i) correcta = 0; else if (correcta > i) correcta--;
+      pintarFilas();
+    };
+  });
+  $("#btn-mas").disabled = ops.length >= 5;
+}
+
+$("#btn-mas").onclick = () => { if (ops.length < 5) { ops.push(""); pintarFilas(); } };
+
+$("#btn-lanzar").onclick = async () => {
+  const texto = $("#inp-texto").value.trim();
+  const r = await api("/api/pregunta", { method: "POST", body: { token, texto, opciones: ops.map((o) => o.trim()), correcta } });
+  if (!r._ok) { $("#msg").innerHTML = `<span class="error">${esc(r.error)}</span>`; return; }
+  volcar("#term-lanzar", r.comandos);
+  $("#msg").textContent = `Pregunta ${r.id} abierta. Los alumnos votan sin ver resultados.`;
+  $("#btn-lanzar").disabled = true;
+  $("#grafico").innerHTML = '<p class="msg">Los conteos aparecen solo al cierre.</p>';
+  $("#ranking").innerHTML = "";
+  $("#enunciado").textContent = texto;
+  reloj.sincronizar(r.restante);
+  clearInterval(sondeo);
+  sondeo = setInterval(cargarEstado, 5000);
+};
+
+function onPregunta() {}
+
+async function cargarEstado() {
+  const d = await api("/api/estado");
+  if (d.estado === "abierta") {
+    $("#btn-lanzar").disabled = true;
+    $("#enunciado").textContent = d.texto;
+    reloj.sincronizar(d.restante);
+  } else if (d.estado === "cerrada") {
+    onCierre(d.cierre);
+  } else if (d.estado === "cerrando") {
+    setTimeout(cargarEstado, 1000);
+  }
+}
+
+function onCierre(m) {
+  clearInterval(sondeo);
+  reloj.detener();
+  $("#btn-lanzar").disabled = false;
+  $("#msg").textContent = `Pregunta ${m.id} cerrada. Correcta: ${letra(m.correcta)} · ${m.opciones[m.correcta]}`;
+  $("#enunciado").textContent = m.texto;
+  grafico($("#grafico"), m.opciones, m.votos, m.correcta);
+  listaRanking($("#ranking"), m.ranking);
+  volcar("#term-stream", m.comandos);
+}
+
+$("#btn-stats").onclick = async () => {
+  const r = await api("/api/stats");
+  if (!r._ok) { $("#stats").innerHTML = `<p class="error">${esc(r.error)}</p>`; return; }
+  volcar("#term-stats", r.comandos);
+  const filas = r.acierto_por_alumno.map((a) =>
+    `<tr><td>${esc(a.nombre)}</td><td>${a.aciertos}/${a.respondidas}</td><td>${a.porcentaje}%</td></tr>`).join("");
+  const f = r.pregunta_mas_fallada;
+  $("#stats").innerHTML = `
+    <h3>Porcentaje de acierto por alumno</h3>
+    ${filas ? `<table><tr><th>Alumno</th><th>Aciertos</th><th>%</th></tr>${filas}</table>` : '<p class="msg">Sin datos todavía.</p>'}
+    <h3>Pregunta más fallada</h3>
+    ${f ? `<p>${esc(f.texto)} · ${f.porcentaje_acierto}% de acierto (${f.respuestas} respuestas)</p>` : '<p class="msg">Sin datos todavía.</p>'}`;
+};
+</script>
+</body>
+</html>
